@@ -56,6 +56,124 @@ export function getAuthorizationUrl(state?: string): string {
   });
 }
 
+interface GoogleTokenResponse {
+  access_token: string;
+  expires_in?: number;
+  refresh_token?: string;
+  scope?: string;
+  token_type?: string;
+}
+
+/**
+ * Robustly exchanges authorization code for tokens using native fetch.
+ * Immune to node-fetch premature close bugs on modern Node.js runtimes.
+ */
+export async function exchangeCodeForTokens(code: string): Promise<GoogleTokenResponse> {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const redirectUri = getRedirectUri();
+
+  if (!clientId || !clientSecret) {
+    throw new Error('Google OAuth credentials not configured in environment.');
+  }
+
+  const params = new URLSearchParams({
+    code,
+    client_id: clientId,
+    client_secret: clientSecret,
+    redirect_uri: redirectUri,
+    grant_type: 'authorization_code',
+  });
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Connection: 'close',
+    },
+    body: params.toString(),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(
+      `Google token exchange error (${res.status}): ${
+        data.error_description || data.error || 'Failed to exchange authorization code'
+      }`
+    );
+  }
+
+  return data as GoogleTokenResponse;
+}
+
+/**
+ * Fetches user profile info from Google userinfo API using native fetch.
+ */
+export async function fetchGoogleUserInfo(
+  accessToken: string
+): Promise<{ email: string; name?: string; picture?: string }> {
+  const res = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Connection: 'close',
+    },
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(
+      `Google userinfo error (${res.status}): ${
+        data.error?.message || data.error || 'Failed to fetch user profile'
+      }`
+    );
+  }
+
+  return data;
+}
+
+/**
+ * Refreshes an expired access token using native fetch.
+ */
+export async function refreshGoogleAccessToken(
+  refreshToken: string
+): Promise<{ access_token: string; expires_in?: number }> {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error('Google OAuth credentials not configured in environment.');
+  }
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type: 'refresh_token',
+  });
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Connection: 'close',
+    },
+    body: params.toString(),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    const errMsg = data.error_description || data.error || '';
+    if (errMsg.includes('invalid_grant') || errMsg.includes('expired') || errMsg.includes('revoked')) {
+      throw new Error(
+        'Gmail authorization was revoked or expired. Please disconnect and reconnect your Google account.'
+      );
+    }
+    throw new Error(`Google token refresh error (${res.status}): ${errMsg}`);
+  }
+
+  return data;
+}
+
 /**
  * Handles the OAuth authorization code exchange, retrieves user profile,
  * encrypts tokens, and stores them in the database.
@@ -66,14 +184,11 @@ export async function handleOAuthCallback(code: string): Promise<{
   name: string | null;
   picture: string | null;
 }> {
-  const client = createOAuth2Client();
-  const { tokens } = await client.getToken(code);
-  client.setCredentials(tokens);
+  // Exchange code for tokens via resilient native fetch
+  const tokens = await exchangeCodeForTokens(code);
 
-  // Fetch user info from Google
-  const oauth2 = google.oauth2({ version: 'v2', auth: client });
-  const userInfoRes = await oauth2.userinfo.get();
-  const userInfo = userInfoRes.data;
+  // Fetch user info from Google via resilient native fetch
+  const userInfo = await fetchGoogleUserInfo(tokens.access_token);
 
   if (!userInfo.email) {
     throw new Error('Google did not return an email address for the authenticated account.');
@@ -84,7 +199,6 @@ export async function handleOAuthCallback(code: string): Promise<{
   const picture = userInfo.picture || null;
 
   // We need a refresh token to send emails later.
-  // Note: Google only sends a refresh token when prompt=consent or on the first authorization.
   let encryptedRefreshToken: string;
 
   if (tokens.refresh_token) {
@@ -94,14 +208,16 @@ export async function handleOAuthCallback(code: string): Promise<{
     const existing = await db.googleAccount.findUnique({ where: { email } });
     if (!existing || !existing.encryptedRefreshToken) {
       throw new Error(
-        'Google did not return a refresh token. Please revoke ColdReach AI permissions in your Google Security settings and reconnect.'
+        'Google did not return a refresh token. Please remove ColdReach AI from https://myaccount.google.com/permissions and reconnect to grant offline access.'
       );
     }
     encryptedRefreshToken = existing.encryptedRefreshToken;
   }
 
   const encryptedAccessToken = tokens.access_token ? encrypt(tokens.access_token) : null;
-  const tokenExpiry = tokens.expiry_date ? new Date(tokens.expiry_date) : null;
+  const tokenExpiry = tokens.expires_in
+    ? new Date(Date.now() + tokens.expires_in * 1000)
+    : null;
   const scope = tokens.scope || GMAIL_SCOPES.join(' ');
 
   // Upsert GoogleAccount record
@@ -160,74 +276,46 @@ export async function getAuthorizedClient(googleAccountId?: string): Promise<{
     try {
       accessToken = decrypt(account.encryptedAccessToken);
     } catch {
-      // Access token decryption failure; fall back to refreshing
       accessToken = undefined;
     }
   }
 
-  client.setCredentials({
-    refresh_token: refreshToken,
-    access_token: accessToken,
-    expiry_date: account.tokenExpiry?.getTime(),
-  });
-
-  // Listen for automatic token refresh events and persist new access token
-  client.on('tokens', async (newTokens) => {
-    try {
-      const updates: {
-        encryptedAccessToken?: string;
-        tokenExpiry?: Date;
-        encryptedRefreshToken?: string;
-      } = {};
-
-      if (newTokens.access_token) {
-        updates.encryptedAccessToken = encrypt(newTokens.access_token);
-      }
-      if (newTokens.expiry_date) {
-        updates.tokenExpiry = new Date(newTokens.expiry_date);
-      }
-      if (newTokens.refresh_token) {
-        updates.encryptedRefreshToken = encrypt(newTokens.refresh_token);
-      }
-
-      await db.googleAccount.update({
-        where: { id: account.id },
-        data: updates,
-      });
-    } catch (err) {
-      console.error('Failed to persist refreshed OAuth tokens:', err);
-    }
-  });
-
   // Pre-emptively refresh if token is missing or near expiry (within 5 minutes)
   const isExpiredOrExpiring =
-    !account.tokenExpiry || account.tokenExpiry.getTime() - Date.now() < 5 * 60 * 1000;
+    !account.tokenExpiry ||
+    !accessToken ||
+    account.tokenExpiry.getTime() - Date.now() < 5 * 60 * 1000;
 
   if (isExpiredOrExpiring) {
     try {
-      const refreshed = await client.refreshAccessToken();
-      client.setCredentials(refreshed.credentials);
+      const refreshed = await refreshGoogleAccessToken(refreshToken);
+      accessToken = refreshed.access_token;
+      const newExpiry = refreshed.expires_in
+        ? new Date(Date.now() + refreshed.expires_in * 1000)
+        : new Date(Date.now() + 3600 * 1000);
 
       await db.googleAccount.update({
         where: { id: account.id },
         data: {
-          encryptedAccessToken: refreshed.credentials.access_token
-            ? encrypt(refreshed.credentials.access_token)
-            : undefined,
-          tokenExpiry: refreshed.credentials.expiry_date
-            ? new Date(refreshed.credentials.expiry_date)
-            : undefined,
+          encryptedAccessToken: encrypt(accessToken),
+          tokenExpiry: newExpiry,
         },
       });
+
+      client.setCredentials({
+        refresh_token: refreshToken,
+        access_token: accessToken,
+        expiry_date: newExpiry.getTime(),
+      });
     } catch (err: any) {
-      const errMsg = err?.message || '';
-      if (errMsg.includes('invalid_grant') || errMsg.includes('Token has been expired or revoked')) {
-        throw new Error(
-          'Gmail authorization was revoked or expired. Please disconnect and reconnect your Google account.'
-        );
-      }
-      throw new Error(`Failed to refresh Gmail authorization: ${errMsg}`);
+      throw err;
     }
+  } else {
+    client.setCredentials({
+      refresh_token: refreshToken,
+      access_token: accessToken,
+      expiry_date: account.tokenExpiry?.getTime(),
+    });
   }
 
   return {
@@ -248,9 +336,14 @@ export async function disconnectGoogleAccount(id?: string): Promise<boolean> {
   if (!account) return false;
 
   try {
-    const client = createOAuth2Client();
     const refreshToken = decrypt(account.encryptedRefreshToken);
-    await client.revokeToken(refreshToken).catch(() => null);
+    await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(refreshToken)}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Connection: 'close',
+      },
+    }).catch(() => null);
   } catch (err) {
     console.warn('Google revokeToken call failed during disconnect, removing local record:', err);
   }

@@ -4,3 +4,25 @@ node_modules
 .DS_Store
 uploads/resumes/*
 !uploads/resumes/.gitkeep
+.env
+.env.local
+.env.*
+!.env.example
+prisma/*.db
+prisma/*.db-journal
+
+# Dependencies
+node_modules/
+
+# Build output
+.next/
+out/
+dist/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store

@@ -1,10 +1,10 @@
-import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import { buildGmailRawMessage } from './mime';
 import { readPdfAttachment } from './pdf';
 
 export interface SendSingleEmailParams {
-  authClient: OAuth2Client;
+  authClient?: OAuth2Client;
+  accessToken?: string;
   fromEmail: string;
   fromName?: string | null;
   toEmail: string;
@@ -25,11 +25,16 @@ export interface SendResult {
 }
 
 /**
- * Sends a single email through the Gmail API using users.messages.send.
+ * Sends a single email directly through the official Gmail API users.messages.send endpoint
+ * using native fetch with Connection: close.
+ *
+ * This completely avoids node-fetch@2's ERR_STREAM_PREMATURE_CLOSE stream destruction bug
+ * on Node 20/22/24/26.
  */
 export async function sendEmailViaGmail(params: SendSingleEmailParams): Promise<SendResult> {
   const {
     authClient,
+    accessToken: providedAccessToken,
     fromEmail,
     fromName,
     toEmail,
@@ -64,20 +69,101 @@ export async function sendEmailViaGmail(params: SendSingleEmailParams): Promise<
           : undefined,
     });
 
-    const gmail = google.gmail({ version: 'v1', auth: authClient });
+    // Obtain access token
+    let token = providedAccessToken || authClient?.credentials?.access_token;
+    if (!token && authClient) {
+      const tokenRes = await authClient.getAccessToken();
+      token = typeof tokenRes === 'string' ? tokenRes : tokenRes?.token;
+    }
 
-    const response = await gmail.users.messages.send({
-      userId: 'me',
-      requestBody: {
-        raw: rawMessage,
+    if (!token) {
+      return {
+        success: false,
+        error: 'No active Google OAuth access token available. Please reconnect your Gmail account.',
+        isTransient: false,
+      };
+    }
+
+    // Call Gmail API users.messages.send directly with native fetch
+    const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Connection: 'close',
       },
+      body: JSON.stringify({
+        raw: rawMessage,
+      }),
     });
 
-    if (response.data.id) {
+    const resData = await response.json();
+
+    if (!response.ok) {
+      const status = response.status;
+      const errorObj = resData?.error || {};
+      const rawMsg = errorObj?.message || 'Gmail API send error';
+      const errorDetails = errorObj?.errors?.[0] || {};
+      const reason = errorDetails?.reason || '';
+
+      // Quota limit exceeded
+      if (
+        status === 403 &&
+        (reason === 'quotaExceeded' ||
+          reason === 'dailyLimitExceeded' ||
+          rawMsg.toLowerCase().includes('quota') ||
+          rawMsg.toLowerCase().includes('limit'))
+      ) {
+        return {
+          success: false,
+          error:
+            'Gmail daily sending quota exceeded. Google standard free accounts allow up to 500 emails/day; Google Workspace allows up to 2,000/day.',
+          isQuotaError: true,
+          isTransient: false,
+        };
+      }
+
+      // Rate limit
+      if (status === 429 || reason === 'rateLimitExceeded' || reason === 'userRateLimitExceeded') {
+        return {
+          success: false,
+          error: 'Gmail API rate limit reached. Backing off before next send.',
+          isTransient: true,
+        };
+      }
+
+      // Auth error
+      if (status === 401 || reason === 'authError') {
+        return {
+          success: false,
+          error: 'Gmail authorization expired or was revoked. Please reconnect your Google account.',
+          isTransient: false,
+        };
+      }
+
+      // Invalid recipient address
+      if (status === 400 && rawMsg.toLowerCase().includes('recipient')) {
+        return {
+          success: false,
+          error: `Recipient address rejected by Gmail: ${rawMsg}`,
+          isTransient: false,
+        };
+      }
+
+      const isTransient = status >= 500 && status < 600;
+
+      return {
+        success: false,
+        error: `Gmail API error (${status}): ${rawMsg}`,
+        isTransient,
+      };
+    }
+
+    if (resData.id) {
       return {
         success: true,
-        messageId: response.data.id,
-        threadId: response.data.threadId || undefined,
+        messageId: resData.id,
+        threadId: resData.threadId || undefined,
       };
     }
 
@@ -87,62 +173,11 @@ export async function sendEmailViaGmail(params: SendSingleEmailParams): Promise<
       isTransient: false,
     };
   } catch (err: any) {
-    const status = err?.status || err?.code || 500;
-    const rawMsg = err?.message || 'Unknown Gmail API error';
-    const errorDetails = err?.response?.data?.error?.errors?.[0] || {};
-    const reason = errorDetails?.reason || '';
-
-    // Check quota exceeded
-    if (
-      status === 403 &&
-      (reason === 'quotaExceeded' ||
-        reason === 'dailyLimitExceeded' ||
-        rawMsg.toLowerCase().includes('quota') ||
-        rawMsg.toLowerCase().includes('limit'))
-    ) {
-      return {
-        success: false,
-        error:
-          'Gmail daily sending quota exceeded. Google imposes a daily limit (500 for standard free Gmail, 2000 for Google Workspace).',
-        isQuotaError: true,
-        isTransient: false,
-      };
-    }
-
-    // Rate limits / Too many requests
-    if (status === 429 || reason === 'rateLimitExceeded' || reason === 'userRateLimitExceeded') {
-      return {
-        success: false,
-        error: 'Gmail API rate limit reached. Backing off before next send.',
-        isTransient: true,
-      };
-    }
-
-    // Auth expired or invalid
-    if (status === 401 || reason === 'authError') {
-      return {
-        success: false,
-        error: 'Gmail authentication expired or was revoked. Please reconnect your Google account.',
-        isTransient: false,
-      };
-    }
-
-    // Invalid recipient address
-    if (status === 400 && rawMsg.toLowerCase().includes('recipient')) {
-      return {
-        success: false,
-        error: `Recipient address rejected by Gmail: ${rawMsg}`,
-        isTransient: false,
-      };
-    }
-
-    // Server errors (500, 503) are transient
-    const isTransient = status >= 500 && status < 600;
-
+    const rawMsg = err?.message || 'Network error communicating with Gmail API';
     return {
       success: false,
-      error: `Gmail API error (${status}): ${rawMsg}`,
-      isTransient,
+      error: `Gmail API network error: ${rawMsg}`,
+      isTransient: true,
     };
   }
 }

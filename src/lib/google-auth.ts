@@ -256,6 +256,7 @@ export async function handleOAuthCallback(code: string): Promise<{
  */
 export async function getAuthorizedClient(googleAccountId?: string): Promise<{
   client: OAuth2Client;
+  accessToken: string;
   email: string;
   name: string | null;
 }> {
@@ -320,6 +321,7 @@ export async function getAuthorizedClient(googleAccountId?: string): Promise<{
 
   return {
     client,
+    accessToken: accessToken!,
     email: account.email,
     name: account.name,
   };

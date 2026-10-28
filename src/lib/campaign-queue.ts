@@ -67,7 +67,7 @@ export async function executeCampaign(campaignId: string): Promise<void> {
   // Start asynchronous processing (non-blocking)
   (async () => {
     try {
-      const { client: authClient, email: fromEmail, name: fromName } =
+      const { client: authClient, accessToken, email: fromEmail, name: fromName } =
         await getAuthorizedClient(campaign.googleAccountId || undefined);
 
       const delayMs = Math.max(1, campaign.sendIntervalSec || 3) * 1000;
@@ -88,6 +88,7 @@ export async function executeCampaign(campaignId: string): Promise<void> {
 
         let sendResult = await sendEmailViaGmail({
           authClient,
+          accessToken,
           fromEmail,
           fromName,
           toEmail: recipient.email,
@@ -108,6 +109,7 @@ export async function executeCampaign(campaignId: string): Promise<void> {
 
             sendResult = await sendEmailViaGmail({
               authClient,
+              accessToken,
               fromEmail,
               fromName,
               toEmail: recipient.email,

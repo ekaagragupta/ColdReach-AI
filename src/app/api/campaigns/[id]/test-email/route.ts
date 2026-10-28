@@ -28,11 +28,12 @@ export async function POST(
       return NextResponse.json({ error: 'Campaign not found' }, { status: 404 });
     }
 
-    const { client: authClient, email: fromEmail, name: fromName } =
+    const { client: authClient, accessToken, email: fromEmail, name: fromName } =
       await getAuthorizedClient(campaign.googleAccountId || undefined);
 
     const result = await sendEmailViaGmail({
       authClient,
+      accessToken,
       fromEmail,
       fromName,
       toEmail: testEmail.trim().toLowerCase(),

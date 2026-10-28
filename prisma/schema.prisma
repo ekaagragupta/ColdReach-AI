@@ -1,0 +1,85 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model GoogleAccount {
+  id                    String     @id @default(cuid())
+  email                 String     @unique
+  name                  String?
+  picture               String?
+  encryptedRefreshToken String
+  encryptedAccessToken  String?
+  tokenExpiry           DateTime?
+  scope                 String?
+  connectedAt           DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+  campaigns             Campaign[]
+}
+
+model Campaign {
+  id                 String              @id @default(cuid())
+  title              String              @default("Outreach Campaign")
+  subject            String
+  bodyText           String
+  bodyHtml           String?
+  status             String              @default("DRAFT") // DRAFT, QUEUED, SENDING, PAUSED, COMPLETED, CANCELLED, FAILED
+  totalRecipients    Int                 @default(0)
+  sentCount          Int                 @default(0)
+  failedCount        Int                 @default(0)
+  pendingCount       Int                 @default(0)
+  sendIntervalSec    Int                 @default(3)
+  googleAccountId    String?
+  googleAccount      GoogleAccount?      @relation(fields: [googleAccountId], references: [id], onDelete: SetNull)
+  attachmentPath     String?
+  attachmentFilename String?
+  attachmentSize     Int?
+  attachmentMime     String?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  recipients         CampaignRecipient[]
+
+  @@index([status])
+}
+
+model CampaignRecipient {
+  id             String    @id @default(cuid())
+  campaignId     String
+  campaign       Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  email          String
+  name           String?
+  company        String?
+  position       String?
+  status         String    @default("PENDING") // PENDING, QUEUED, SENDING, SENT, FAILED, CANCELLED
+  gmailMessageId String?
+  gmailThreadId  String?
+  errorMessage   String?
+  retryCount     Int       @default(0)
+  sentAt         DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([campaignId, status])
+  @@index([email])
+}
+
+model SuppressionEntry {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  reason       String?  @default("Previously Contacted")
+  suppressedAt DateTime @default(now())
+}
+
+model AppSettings {
+  id                  String   @id @default("default")
+  defaultSendInterval Int      @default(3)
+  dailySendLimit      Int      @default(500)
+  maxRetries          Int      @default(2)
+  updatedAt           DateTime @updatedAt
+}
